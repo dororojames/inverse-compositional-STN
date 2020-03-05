@@ -1,90 +1,107 @@
 import numpy as np
 import scipy.linalg
 import torch
+import torch.nn.functional as F
+from torch import nn
 
-import util
+# fit (affine) warp between two sets of points
 
-# fit (affine) warp between two sets of points 
-def fit(Xsrc,Xdst):
-	ptsN = len(Xsrc)
-	X,Y,U,V,O,I = Xsrc[:,0],Xsrc[:,1],Xdst[:,0],Xdst[:,1],np.zeros([ptsN]),np.ones([ptsN])
-	A = np.concatenate((np.stack([X,Y,I,O,O,O],axis=1),
-						np.stack([O,O,O,X,Y,I],axis=1)),axis=0)
-	b = np.concatenate((U,V),axis=0)
-	p1,p2,p3,p4,p5,p6 = scipy.linalg.lstsq(A,b)[0].squeeze()
-	pMtrx = np.array([[p1,p2,p3],[p4,p5,p6],[0,0,1]],dtype=torch.float32)
-	return pMtrx
 
-# compute composition of warp parameters
-def compose(opt,p,dp):
-	pMtrx = vec2mtrx(opt,p)
-	dpMtrx = vec2mtrx(opt,dp)
-	pMtrxNew = dpMtrx.matmul(pMtrx)
-	pMtrxNew = pMtrxNew/pMtrxNew[:,2:3,2:3]
-	pNew = mtrx2vec(opt,pMtrxNew)
-	return pNew
+def fit(Xsrc, Xdst):
+    ptsN = len(Xsrc)
+    X, Y, U, V, O, I = Xsrc[:, 0], Xsrc[:, 1], Xdst[:,
+                                                    0], Xdst[:, 1], np.zeros([ptsN]), np.ones([ptsN])
+    A = np.concatenate((np.stack([X, Y, I, O, O, O], axis=1),
+                        np.stack([O, O, O, X, Y, I], axis=1)), axis=0)
+    b = np.concatenate((U, V), axis=0)
+    p1, p2, p3, p4, p5, p6 = scipy.linalg.lstsq(A, b)[0].squeeze()
+    pMtrx = np.array([[p1, p2, p3], [p4, p5, p6], [0, 0, 1]],
+                     dtype=torch.float32)
+    return pMtrx
 
-# compute inverse of warp parameters
-def inverse(opt,p):
-	pMtrx = vec2mtrx(opt,p)
-	pInvMtrx = pMtrx.inverse()
-	pInv = mtrx2vec(opt,pInvMtrx)
-	return pInv
 
-# convert warp parameters to matrix
-def vec2mtrx(opt,p):
-	O = torch.zeros(opt.batchSize,dtype=torch.float32).cuda()
-	I = torch.ones(opt.batchSize,dtype=torch.float32).cuda()
-	if opt.warpType=="translation":
-		tx,ty = torch.unbind(p,dim=1)
-		pMtrx = torch.stack([torch.stack([I,O,tx],dim=-1),
-							 torch.stack([O,I,ty],dim=-1),
-							 torch.stack([O,O,I],dim=-1)],dim=1)
-	if opt.warpType=="similarity":
-		pc,ps,tx,ty = torch.unbind(p,dim=1)
-		pMtrx = torch.stack([torch.stack([I+pc,-ps,tx],dim=-1),
-							 torch.stack([ps,I+pc,ty],dim=-1),
-							 torch.stack([O,O,I],dim=-1)],dim=1)
-	if opt.warpType=="affine":
-		p1,p2,p3,p4,p5,p6 = torch.unbind(p,dim=1)
-		pMtrx = torch.stack([torch.stack([I+p1,p2,p3],dim=-1),
-							 torch.stack([p4,I+p5,p6],dim=-1),
-							 torch.stack([O,O,I],dim=-1)],dim=1)
-	if opt.warpType=="homography":
-		p1,p2,p3,p4,p5,p6,p7,p8 = torch.unbind(p,dim=1)
-		pMtrx = torch.stack([torch.stack([I+p1,p2,p3],dim=-1),
-							 torch.stack([p4,I+p5,p6],dim=-1),
-							 torch.stack([p7,p8,I],dim=-1)],dim=1)
-	return pMtrx
+def vec2mtrx(p):
+    """convert warp parameters to matrix"""
+    B = p.size(0)
+    O = p.new_zeros(B)
+    I = p.new_ones(B)
 
-# convert warp matrix to parameters
-def mtrx2vec(opt,pMtrx):
-	[row0,row1,row2] = torch.unbind(pMtrx,dim=1)
-	[e00,e01,e02] = torch.unbind(row0,dim=1)
-	[e10,e11,e12] = torch.unbind(row1,dim=1)
-	[e20,e21,e22] = torch.unbind(row2,dim=1)
-	if opt.warpType=="translation": p = torch.stack([e02,e12],dim=1)
-	if opt.warpType=="similarity": p = torch.stack([e00-1,e10,e02,e12],dim=1)
-	if opt.warpType=="affine": p = torch.stack([e00-1,e01,e02,e10,e11-1,e12],dim=1)
-	if opt.warpType=="homography": p = torch.stack([e00-1,e01,e02,e10,e11-1,e12,e20,e21],dim=1)
-	return p
+    if p.size(1) == 2:  # "translation"
+        tx, ty = torch.unbind(p, dim=1)
+        pMtrx = torch.stack([torch.stack([I, O, tx], dim=-1),
+                             torch.stack([O, I, ty], dim=-1),
+                             torch.stack([O, O, I], dim=-1)], dim=1)
+    elif p.size(1) == 4:  # "similarity"
+        pc, ps, tx, ty = torch.unbind(p, dim=1)
+        pMtrx = torch.stack([torch.stack([I+pc, -ps, tx], dim=-1),
+                             torch.stack([ps, I+pc, ty], dim=-1),
+                             torch.stack([O, O, I], dim=-1)], dim=1)
+    elif p.size(1) == 6:  # "affine"
+        p1, p2, p3, p4, p5, p6 = torch.unbind(p, dim=1)
+        pMtrx = torch.stack([torch.stack([I+p1, p2, p3], dim=-1),
+                             torch.stack([p4, I+p5, p6], dim=-1),
+                             torch.stack([O, O, I], dim=-1)], dim=1)
+    elif p.size(1) == 8:  # "homography"
+        I = torch.eye(3).to(p.device).repeat(B, 1, 1)
+        p = torch.cat([p, torch.zeros_like(p[..., 0:1])], dim=-1)
+        pMtrx = p.view_as(I) + I
 
-# warp the image
-def transformImage(opt,image,pMtrx):
-	refMtrx = torch.from_numpy(opt.refMtrx).cuda()
-	refMtrx = refMtrx.repeat(opt.batchSize,1,1)
-	transMtrx = refMtrx.matmul(pMtrx)
-	# warp the canonical coordinates
-	X,Y = np.meshgrid(np.linspace(-1,1,opt.W),np.linspace(-1,1,opt.H))
-	X,Y = X.flatten(),Y.flatten()
-	XYhom = np.stack([X,Y,np.ones_like(X)],axis=1).T
-	XYhom = np.tile(XYhom,[opt.batchSize,1,1]).astype(np.float32)
-	XYhom = torch.from_numpy(XYhom).cuda()
-	XYwarpHom = transMtrx.matmul(XYhom)
-	XwarpHom,YwarpHom,ZwarpHom = torch.unbind(XYwarpHom,dim=1)
-	Xwarp = (XwarpHom/(ZwarpHom+1e-8)).reshape(opt.batchSize,opt.H,opt.W)
-	Ywarp = (YwarpHom/(ZwarpHom+1e-8)).reshape(opt.batchSize,opt.H,opt.W)
-	grid = torch.stack([Xwarp,Ywarp],dim=-1)
-	# sampling with bilinear interpolation
-	imageWarp = torch.nn.functional.grid_sample(image,grid,mode="bilinear")
-	return imageWarp
+    return pMtrx
+
+
+def mtrx2vec(pMtrx, warpType):
+    """convert warp matrix to parameters"""
+    row0, row1, row2 = torch.unbind(pMtrx, dim=1)
+    e00, e01, e02 = torch.unbind(row0, dim=1)
+    e10, e11, e12 = torch.unbind(row1, dim=1)
+    e20, e21,   _ = torch.unbind(row2, dim=1)
+    if warpType == "translation":
+        p = torch.stack([e02, e12], dim=1)
+    elif warpType == "similarity":
+        p = torch.stack([e00-1, e10, e02, e12], dim=1)
+    elif warpType == "affine":
+        p = torch.stack([e00-1, e01, e02, e10, e11-1, e12], dim=1)
+    elif warpType == "homography":
+        p = torch.stack([e00-1, e01, e02, e10, e11-1, e12, e20, e21], dim=1)
+    return p
+
+
+def compose(p, dp, warpType):
+    """compute composition of warp parameters"""
+    pMtrx = vec2mtrx(p)
+    dpMtrx = vec2mtrx(dp)
+    pMtrxNew = dpMtrx.matmul(pMtrx)
+    pMtrxNew = pMtrxNew/pMtrxNew[:, 2:3, 2:3]
+    pNew = mtrx2vec(pMtrxNew, warpType)
+    return pNew
+
+
+def inverse(p, warpType):
+    """compute inverse of warp parameters"""
+    pMtrx = vec2mtrx(p)
+    pInvMtrx = pMtrx.inverse()
+    pInv = mtrx2vec(pInvMtrx, warpType)
+    return pInv
+
+
+def transformImage(image, p):
+    """warp the image"""
+    B, _, H, W = image.size()
+    pMtrx = vec2mtrx(p)
+    refMtrx = torch.eye(3).to(p.device).repeat(B, 1, 1)
+    transMtrx = refMtrx.matmul(pMtrx)
+
+    # warp the canonical coordinates
+    X, Y = torch.meshgrid(torch.linspace(-1, 1, W),
+                          torch.linspace(-1, 1, H))
+    X, Y = X.flatten(), Y.flatten()
+    XYhom = torch.stack([X, Y, torch.ones_like(X)], dim=1).t()
+    XYhom = XYhom.repeat(B, 1, 1).to(image.device)
+    XYwarpHom = transMtrx.matmul(XYhom).transpose(1, 2).reshape(B, H, W, 3)
+
+    grid, ZwarpHom = XYwarpHom.split([2, 1], dim=-1)
+    grid = grid / ZwarpHom.add(1e-8)
+
+    # sampling with bilinear interpolation
+    imageWarp = F.grid_sample(image, grid, mode="bilinear", align_corners=True)
+    return imageWarp
