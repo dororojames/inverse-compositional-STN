@@ -20,7 +20,7 @@ def fit(Xsrc, Xdst):
     return pMtrx
 
 
-def vec2mtrx(p):
+def vec2mat(p):
     """convert warp parameters to matrix"""
     B = p.size(0)
     O = p.new_zeros(B)
@@ -49,7 +49,7 @@ def vec2mtrx(p):
     return pMtrx
 
 
-def mtrx2vec(pMtrx, warpType):
+def mat2vec(pMtrx, warpType):
     """convert warp matrix to parameters"""
     row0, row1, row2 = torch.unbind(pMtrx, dim=1)
     e00, e01, e02 = torch.unbind(row0, dim=1)
@@ -68,39 +68,57 @@ def mtrx2vec(pMtrx, warpType):
 
 def compose(p, dp, warpType):
     """compute composition of warp parameters"""
-    pMtrx = vec2mtrx(p)
-    dpMtrx = vec2mtrx(dp)
-    pMtrxNew = dpMtrx.matmul(pMtrx)
+    pMtrx = vec2mat(p)
+    dpMtrx = vec2mat(dp)
+    pMtrxNew = dpMtrx.bmm(pMtrx)
     pMtrxNew = pMtrxNew/pMtrxNew[:, 2:3, 2:3]
-    pNew = mtrx2vec(pMtrxNew, warpType)
+    pNew = mat2vec(pMtrxNew, warpType)
     return pNew
 
 
 def inverse(p, warpType):
     """compute inverse of warp parameters"""
-    pMtrx = vec2mtrx(p)
+    pMtrx = vec2mat(p)
     pInvMtrx = pMtrx.inverse()
-    pInv = mtrx2vec(pInvMtrx, warpType)
+    pInv = mat2vec(pInvMtrx, warpType)
     return pInv
+
+
+def meshgrid(size):
+    # type: (List[int]) -> Tensor
+    """return meshgrid (B, H, W, 2) of input size(width first, range (-1, -1)~(1, 1))"""
+    coordh, coordw = torch.meshgrid(torch.linspace(-1, 1, size[-2]),
+                                    torch.linspace(-1, 1, size[-1]))
+    return torch.stack([coordw, coordh], dim=2).repeat(size[0], 1, 1, 1)
+
+
+def cat_grid_z(grid, fill_value: int = 1):
+    """concat z axis of grid at last dim , return shape (B, H, W, 3)"""
+    return torch.cat([grid, torch.full_like(grid[..., 0:1], fill_value)], dim=-1)
+
+
+def affine_grid(theta, size):
+    # type: (Tensor, List[int]) -> Tensor
+    grid = meshgrid(size).to(theta.device)
+    return cat_grid_z(grid).flatten(1, 2).bmm(theta.transpose(1, 2)).view_as(grid)
+
+
+def homography_grid(matrix, size):
+    # type: (Tensor, List[int]) -> Tensor
+    grid = cat_grid_z(meshgrid(size).to(matrix.device))  # B, H, W, 3
+    homography = grid.flatten(1, 2).bmm(matrix.transpose(1, 2)).view_as(grid)
+    grid, ZwarpHom = homography.split([2, 1], dim=-1)
+    return grid / ZwarpHom.add(1e-8)
 
 
 def transformImage(image, p):
     """warp the image"""
-    B, _, H, W = image.size()
-    pMtrx = vec2mtrx(p)
-    refMtrx = torch.eye(3).to(p.device).repeat(B, 1, 1)
-    transMtrx = refMtrx.matmul(pMtrx)
+    if p.size(0) != image.size(0):
+        p = p.repeat(image.size(0), 1)
+    transMtrx = vec2mat(p)
 
     # warp the canonical coordinates
-    X, Y = torch.meshgrid(torch.linspace(-1, 1, W),
-                          torch.linspace(-1, 1, H))
-    X, Y = X.flatten(), Y.flatten()
-    XYhom = torch.stack([X, Y, torch.ones_like(X)], dim=1).t()
-    XYhom = XYhom.repeat(B, 1, 1).to(image.device)
-    XYwarpHom = transMtrx.matmul(XYhom).transpose(1, 2).reshape(B, H, W, 3)
-
-    grid, ZwarpHom = XYwarpHom.split([2, 1], dim=-1)
-    grid = grid / ZwarpHom.add(1e-8)
+    grid = homography_grid(transMtrx, image.size())
 
     # sampling with bilinear interpolation
     imageWarp = F.grid_sample(image, grid, mode="bilinear", align_corners=True)
